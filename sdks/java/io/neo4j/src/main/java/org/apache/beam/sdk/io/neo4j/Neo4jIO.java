@@ -17,7 +17,7 @@
  */
 package org.apache.beam.sdk.io.neo4j;
 
-import static org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions.checkArgument;
+import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions.checkArgument;
 
 import com.google.auto.value.AutoValue;
 import java.io.Serializable;
@@ -30,7 +30,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.beam.repackaged.core.org.apache.commons.lang3.StringUtils;
+import org.apache.beam.sdk.coders.BigEndianIntegerCoder;
 import org.apache.beam.sdk.coders.Coder;
+import org.apache.beam.sdk.coders.KvCoder;
 import org.apache.beam.sdk.harness.JvmInitializer;
 import org.apache.beam.sdk.options.ValueProvider;
 import org.apache.beam.sdk.schemas.NoSuchSchemaException;
@@ -39,13 +41,14 @@ import org.apache.beam.sdk.schemas.SchemaRegistry;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.transforms.Reshuffle;
 import org.apache.beam.sdk.transforms.SerializableFunction;
 import org.apache.beam.sdk.transforms.display.DisplayData;
 import org.apache.beam.sdk.transforms.display.HasDisplayData;
+import org.apache.beam.sdk.values.KV;
 import org.apache.beam.sdk.values.PCollection;
-import org.apache.beam.sdk.values.PDone;
 import org.apache.beam.sdk.values.TypeDescriptor;
-import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
+import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Preconditions;
 import org.checkerframework.checker.initialization.qual.Initialized;
 import org.checkerframework.checker.nullness.qual.NonNull;
 import org.checkerframework.checker.nullness.qual.Nullable;
@@ -814,23 +817,17 @@ public class Neo4jIO {
       // We could actually read and write here depending on the type of transaction
       // we picked.  As long as the Cypher statement returns values it's fine.
       //
-      TransactionWork<Void> transactionWork =
+      TransactionWork<List<OutputT>> transactionWork =
           transaction -> {
             Result result = transaction.run(cypher, parametersMap);
-            while (result.hasNext()) {
-              Record record = result.next();
-              try {
-                OutputT outputT = rowMapper.mapRow(record);
-                processContext.output(outputT);
-              } catch (Exception e) {
-                throw new RuntimeException("error mapping Neo4j record to row", e);
-              }
-            }
-
-            // We deliver no specific Neo4j transaction output beyond what goes to the context
-            // output
-            //
-            return null;
+            return result.list(
+                record -> {
+                  try {
+                    return rowMapper.mapRow(record);
+                  } catch (Exception e) {
+                    throw new RuntimeException("error mapping Neo4j record to row", e);
+                  }
+                });
           };
 
       if (logCypher) {
@@ -852,11 +849,13 @@ public class Neo4jIO {
       if (driverSession.session == null) {
         throw new RuntimeException("neo4j session was not initialized correctly");
       } else {
+        List<OutputT> outputs;
         if (writeTransaction) {
-          driverSession.session.writeTransaction(transactionWork, transactionConfig);
+          outputs = driverSession.session.writeTransaction(transactionWork, transactionConfig);
         } else {
-          driverSession.session.readTransaction(transactionWork, transactionConfig);
+          outputs = driverSession.session.readTransaction(transactionWork, transactionConfig);
         }
+        outputs.forEach(processContext::output);
       }
     }
   }
@@ -893,7 +892,7 @@ public class Neo4jIO {
   /** This is the class which handles the work behind the {@link #writeUnwind()} method. */
   @AutoValue
   public abstract static class WriteUnwind<ParameterT>
-      extends PTransform<PCollection<ParameterT>, PDone> {
+      extends PTransform<PCollection<ParameterT>, PCollection<ParameterT>> {
 
     abstract @Nullable SerializableFunction<Void, Driver> getDriverProviderFn();
 
@@ -911,6 +910,8 @@ public class Neo4jIO {
     abstract @Nullable ValueProvider<Long> getBatchSize();
 
     abstract @Nullable ValueProvider<Boolean> getLogCypher();
+
+    abstract @Nullable ValueProvider<Integer> getParallelism();
 
     abstract Builder<ParameterT> toBuilder();
 
@@ -989,6 +990,20 @@ public class Neo4jIO {
       return toBuilder().setBatchSize(batchSize).build();
     }
 
+    public WriteUnwind<ParameterT> withParallelism(ValueProvider<Integer> parallelism) {
+      checkArgument(
+          parallelism != null && parallelism.get() >= 0,
+          "Neo4jIO.writeUnwind().withBatchSize(parallelism) called with parallelism<=0");
+      return toBuilder().setParallelism(parallelism).build();
+    }
+
+    public WriteUnwind<ParameterT> withParallelism(int parallelism) {
+      checkArgument(
+          parallelism > 0,
+          "Neo4jIO.writeUnwind().withBatchSize(parallelism) called with parallelism<=0");
+      return withParallelism(ValueProvider.StaticValueProvider.of(parallelism));
+    }
+
     public WriteUnwind<ParameterT> withParametersFunction(
         SerializableFunction<ParameterT, Map<String, Object>> parametersFunction) {
       checkArgument(
@@ -1002,7 +1017,7 @@ public class Neo4jIO {
     }
 
     @Override
-    public PDone expand(PCollection<ParameterT> input) {
+    public PCollection<ParameterT> expand(PCollection<ParameterT> input) {
 
       final SerializableFunction<Void, Driver> driverProviderFn = getDriverProviderFn();
       final SerializableFunction<ParameterT, Map<String, Object>> parametersFunction =
@@ -1047,9 +1062,16 @@ public class Neo4jIO {
               logCypher,
               unwindMapName);
 
-      input.apply(ParDo.of(writeFn));
+      Integer parallelism = getProvidedValue(getParallelism());
+      if (parallelism == null) {
+        parallelism = 1;
+      }
 
-      return PDone.in(input.getPipeline());
+      return input
+          .apply(ParDo.of(new Reshuffle.AssignShardFn<>(parallelism)))
+          .setCoder(KvCoder.of(BigEndianIntegerCoder.of(), input.getCoder()))
+          .apply(ParDo.of(writeFn))
+          .setRowSchema(input.getSchema());
     }
 
     @Override
@@ -1084,6 +1106,8 @@ public class Neo4jIO {
 
       abstract Builder<ParameterT> setBatchSize(ValueProvider<Long> batchSize);
 
+      abstract Builder<ParameterT> setParallelism(ValueProvider<Integer> parallelism);
+
       abstract Builder<ParameterT> setLogCypher(ValueProvider<Boolean> logCypher);
 
       abstract WriteUnwind<ParameterT> build();
@@ -1091,7 +1115,8 @@ public class Neo4jIO {
   }
 
   /** A {@link DoFn} to execute a Cypher query to read from Neo4j. */
-  private static class WriteUnwindFn<ParameterT> extends ReadWriteFn<ParameterT, Void> {
+  private static class WriteUnwindFn<ParameterT>
+      extends ReadWriteFn<KV<Integer, ParameterT>, ParameterT> {
 
     private final @NonNull String cypher;
     private final @Nullable SerializableFunction<ParameterT, Map<String, Object>>
@@ -1130,11 +1155,11 @@ public class Neo4jIO {
     public void processElement(ProcessContext context) {
       // Map the input data to the parameters map...
       //
-      ParameterT parameters = context.element();
+      KV<Integer, ParameterT> parameters = context.element();
       if (parametersFunction != null) {
         // Every input element creates a new Map<String,Object> entry in unwindList
         //
-        unwindList.add(parametersFunction.apply(parameters));
+        unwindList.add(parametersFunction.apply(parameters.getValue()));
       } else {
         // Someone is writing a bunch of static or procedurally generated values to Neo4j
         unwindList.add(Collections.emptyMap());
@@ -1168,13 +1193,7 @@ public class Neo4jIO {
       //
       TransactionWork<Void> transactionWork =
           transaction -> {
-            Result result = transaction.run(cypher, parametersMap);
-            while (result.hasNext()) {
-              // This just consumes any output but the function basically has no output
-              // To be revisited based on requirements.
-              //
-              result.next();
-            }
+            transaction.run(cypher, parametersMap).consume();
             return null;
           };
 
